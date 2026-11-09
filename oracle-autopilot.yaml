@@ -1,0 +1,43 @@
+# Oracle Desk — cloud autopilot schedule
+# Save this file in your repo at:  .github/workflows/oracle-autopilot.yml
+# Then add the secrets in  Settings → Secrets and variables → Actions → New repository secret:
+#   DERIV_TOKEN, DERIV_APP_ID, (optional) DERIV_ACCOUNT_ID
+# It starts in DRY RUN (logs only). Change MODE to "trade" below when the dry-run logs look right.
+name: Oracle autopilot
+
+on:
+  schedule:
+    - cron: "1,16,31,46 * * * *"   # one minute after every 15m candle closes (UTC)
+  workflow_dispatch:                 # lets you press "Run workflow" by hand
+
+concurrency:
+  group: oracle-autopilot
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run the engine
+        run: node bot.js
+        env:
+          DERIV_TOKEN: ${{ secrets.DERIV_TOKEN }}
+          DERIV_APP_ID: ${{ secrets.DERIV_APP_ID }}
+          DERIV_ACCOUNT_ID: ${{ secrets.DERIV_ACCOUNT_ID }}
+          MODE: dry            # change to: trade
+          SYMBOLS: frxXAUUSD   # comma-separated, e.g. frxXAUUSD,frxEURUSD,frxGBPUSD
+          TF: "900"            # 900 = 15m; keep in step with the cron above
+          RISK_PCT: "1"
+          RR: "2"
+          THRESHOLD: "70"
+          MULT: "100"
+          MAX_TRADES: "6"
+          DAILY_LOSS: "3"
+          KZ_ONLY: "true"
+          BIAS_ONLY: "true"
+          REAL_OK: "false"     # must be "true" before it will touch a real account
