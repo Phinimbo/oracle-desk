@@ -250,7 +250,7 @@ tr:last-child td{border-bottom:0}
         <button class="sell" id="btnSell">SELL ▼</button>
       </div>
       <button style="width:100%;margin-top:8px" id="btnUseSignal">Fill stop & target from the engine</button>
-      <div class="note" id="oeNote">Paper mode: trades are simulated against live price, no account needed. Connect a Deriv token in Settings to trade demo or real.</div>
+      <div class="note" id="oeNote">Paper mode: trades are simulated against live price, no account needed. Add your Deriv token and App ID in Settings to trade demo or real.</div>
     </div>
   </section>
 
@@ -298,12 +298,14 @@ tr:last-child td{border-bottom:0}
 <aside id="drawer" aria-label="Settings">
   <div class="row"><h3 style="flex:1">Settings</h3><button id="btnCloseDrawer">Close</button></div>
   <div class="form">
-    <label class="full">Deriv API token<input id="token" type="password" placeholder="paste token (scopes: Read, Trade, Trading information)" autocomplete="off"></label>
+    <label class="full">Deriv personal access token<input id="token" type="password" placeholder="pat_… (needs trade scope)" autocomplete="off"></label>
+    <label class="full">Deriv App ID<input id="appId" inputmode="numeric" placeholder="from developers.deriv.com → Manage Applications" autocomplete="off"></label>
+    <label class="full">Account to trade<select id="accountId"><option value="">(connect once to list your accounts)</option></select></label>
     <label class="full">Trading mode
       <select id="mode"><option value="paper">Paper (simulated, no token needed)</option><option value="deriv">Deriv account (demo or real, token required)</option></select>
     </label>
   </div>
-  <div class="note">Create a token at Deriv → Settings → Security → API token. Start with your <b>demo (VRTC) account</b>. The token is stored only in this browser.</div>
+  <div class="note">Token: Deriv account → Settings → Security → API token (personal access token). App ID: sign in at <b>developers.deriv.com</b>, open Manage Applications, register an app and copy its ID. Both are needed; both stay in this browser only. Start on your <b>demo</b> account.</div>
 
   <div class="sec"><div class="eyebrow">Risk brakes</div>
     <div class="form">
@@ -341,7 +343,9 @@ const SYMBOLS=[
  {s:'cryBTCUSD',n:'BTC / USD'},{s:'R_100',n:'Volatility 100'},{s:'R_75',n:'Volatility 75'},{s:'1HZ100V',n:'Volatility 100 (1s)'}
 ];
 const TFS=[{l:'1m',g:60},{l:'5m',g:300},{l:'15m',g:900},{l:'1h',g:3600},{l:'4h',g:14400},{l:'1D',g:86400}];
-const WS_URLS=['wss://ws.derivws.com/websockets/v3?app_id=1089','wss://ws.binaryws.com/websockets/v3?app_id=1089'];
+// Deriv's 2026 API: public market data over one socket, authenticated trading over a second socket opened with a one-time URL from REST.
+const PUBLIC_WS=['wss://api.derivws.com/trading/v1/options/ws/public','wss://ws.derivws.com/websockets/v3?app_id=1089'];
+const REST_BASE='https://api.derivws.com/trading/v1/options';
 const PAPER_START=10000;
 
 const S={
@@ -351,7 +355,8 @@ const S={
   paper:{balance:PAPER_START, open:[], hist:[]},
   live:{open:{}, hist:[], subs:{}},
   auto:false, killed:false, btDone:{}, bt:null, mults:[100],
-  settings:{token:'',mode:'paper',riskPct:1,rr:2,maxTrades:6,dailyLoss:3,cooldown:30,maxOpen:1,threshold:70,lookback:8,maxHold:60,cost:0.01,kzOnly:true,biasOnly:true,realOk:false,mult:100},
+  settings:{token:'',appId:'',accountId:'',mode:'paper',riskPct:1,rr:2,maxTrades:6,dailyLoss:3,cooldown:30,maxOpen:1,threshold:70,lookback:8,maxHold:60,cost:0.01,kzOnly:true,biasOnly:true,realOk:false,mult:100},
+  accounts:[],
   lastLossAt:0, dayStartBal:null, dayKey:''
 };
 const $=id=>document.getElementById(id);
@@ -366,14 +371,16 @@ function load(k,d){ try{ const v=localStorage.getItem(k); return v?JSON.parse(v)
 
 /* ============================= DERIV WS ============================= */
 class Deriv{
-  constructor(){ this.ws=null; this.id=1; this.pending={}; this.subs={}; this.pingT=null; }
-  connect(urlIdx=0){ return new Promise((res,rej)=>{
-    const url=WS_URLS[urlIdx]; let ws; try{ ws=new WebSocket(url); }catch(e){ return rej(e); }
-    let settled=false; this.ws=ws;
-    ws.onopen=()=>{ settled=true; this.pingT=setInterval(()=>{ try{ ws.send(JSON.stringify({ping:1})); }catch(e){} },30000); res(); };
+  constructor(name){ this.name=name; this.ws=null; this.id=1; this.pending={}; this.subs={}; this.pingT=null; this.open=false; }
+  connect(urls,idx=0){ return new Promise((res,rej)=>{
+    const url=urls[idx]; let ws; try{ ws=new WebSocket(url); }catch(e){ return rej(e); }
+    let settled=false; this.ws=ws; this.url=url;
+    const timer=setTimeout(()=>{ if(!settled){ settled=true; try{ ws.close(); }catch(e){} next(); } },8000);
+    const next=()=>{ if(idx+1<urls.length) this.connect(urls,idx+1).then(res,rej); else rej(new Error('Could not reach Deriv ('+this.name+')')); };
+    ws.onopen=()=>{ settled=true; clearTimeout(timer); this.open=true; this.pingT=setInterval(()=>{ try{ ws.send(JSON.stringify({ping:1})); }catch(e){} },30000); res(); };
     ws.onmessage=e=>{ try{ this.handle(JSON.parse(e.data)); }catch(err){} };
-    ws.onclose=()=>{ clearInterval(this.pingT); this.onClose&&this.onClose(); };
-    ws.onerror=()=>{ if(!settled){ settled=true; if(urlIdx+1<WS_URLS.length) this.connect(urlIdx+1).then(res,rej); else rej(new Error('Could not reach Deriv')); } };
+    ws.onclose=()=>{ clearInterval(this.pingT); const was=this.open; this.open=false; if(was) this.onClose&&this.onClose(); };
+    ws.onerror=()=>{ if(!settled){ settled=true; clearTimeout(timer); next(); } };
   }); }
   send(req){ return new Promise((res,rej)=>{ const id=this.id++; req.req_id=id; this.pending[id]={res,rej}; this.ws.send(JSON.stringify(req)); }); }
   subscribe(req,cb){ return new Promise((res,rej)=>{ const id=this.id++; req.req_id=id; req.subscribe=1; this.subs[id]=cb; this.pending[id]={res,rej,keep:true}; this.ws.send(JSON.stringify(req)); }); }
@@ -383,10 +390,18 @@ class Deriv{
     if(p){ p.res(m); if(!p.keep) delete this.pending[id]; else p.res=()=>{}; }
     if(this.subs[id]) this.subs[id](m);
   }
-  forget(subId){ if(!subId) return Promise.resolve(); return this.send({forget:subId}).catch(()=>{}); }
+  forget(subId){ if(!subId||!this.open) return Promise.resolve(); return this.send({forget:subId}).catch(()=>{}); }
   close(){ try{ this.ws&&this.ws.close(); }catch(e){} }
 }
-const api=new Deriv();
+const api=new Deriv('market data');   // public socket: candles, ticks, symbols
+const tapi=new Deriv('trading');      // authenticated socket: balance, orders, positions
+const acct=()=>S.authorized&&tapi.open?tapi:api; // data calls that prefer the account socket when it exists
+async function rest(path,method='GET'){
+  const r=await fetch(REST_BASE+path,{method,headers:{'Authorization':'Bearer '+S.settings.token.trim(),'Deriv-App-ID':String(S.settings.appId).trim(),'Content-Type':'application/json'}});
+  let j={}; try{ j=await r.json(); }catch(e){}
+  if(!r.ok){ const e=(j.errors&&j.errors[0])||{}; throw new Error((e.code?e.code+': ':'')+(e.message||('HTTP '+r.status))); }
+  return j;
+}
 
 /* ============================= INDICATORS & ICT ============================= */
 function ema(vals,n){ const k=2/(n+1); const out=new Array(vals.length).fill(null); let e=null; for(let i=0;i<vals.length;i++){ e=e==null?vals[i]:vals[i]*k+e*(1-k); if(i>=n-1) out[i]=e; } return out; }
@@ -585,13 +600,13 @@ async function placeTrade(dir,sl,tp,src){
   if(!S.authorized){ log('Connect a Deriv token in Settings first','err'); return; }
   if(src==='auto'&&!S.acct.is_virtual&&!S.settings.realOk){ log('Auto-trade on a REAL account needs the acknowledgement in Settings','err'); return; }
   const m=+$('mult').value||100; let stake=risk/(m*R/px); stake=Math.max(1,Math.round(stake*100)/100); const lossAmt=Math.round(Math.min(risk,stake*0.99)*100)/100; const tpAmt=Math.round(stake*m*Math.abs(tp-px)/px*100)/100;
-  try{ const r=await api.send({buy:1,price:stake,parameters:{amount:stake,basis:'stake',contract_type:dir===1?'MULTUP':'MULTDOWN',currency:S.currency,multiplier:m,symbol:S.symbol,limit_order:{stop_loss:lossAmt,take_profit:Math.max(0.01,tpAmt)}}});
+  try{ const r=await tapi.send({buy:'1',price:stake,parameters:{amount:stake,basis:'stake',contract_type:dir===1?'MULTUP':'MULTDOWN',currency:S.currency,multiplier:m,underlying_symbol:S.symbol,limit_order:{stop_loss:lossAmt,take_profit:Math.max(0.01,tpAmt)}}});
     const id=r.buy.contract_id; log(`${S.acct.is_virtual?'DEMO':'REAL'} ${dir===1?'BUY':'SELL'} ${S.symbol} · stake ${money(stake)} ×${m} · stop -${money(lossAmt)} · target +${money(tpAmt)} · #${id}`,'ok');
     S.live.open[id]={id,symbol:S.symbol,dir,entry:px,sl,tp,risk,stake,opened:Date.now()/1000,profit:0,src}; watchContract(id); renderPositions(); drawChart();
   }catch(e){ log('Order rejected: '+(e.message||JSON.stringify(e)),'err'); }
 }
-function watchContract(id){ api.subscribe({proposal_open_contract:1,contract_id:id},m=>{ const p=m.proposal_open_contract; if(!p) return; const pos=S.live.open[id]; if(!pos) return; pos.profit=+p.profit||0; pos.now=+p.current_spot||pos.now; if(p.entry_spot) pos.entry=+p.entry_spot; if(p.is_sold||p.status==='sold'||p.status==='lost'||p.status==='won'){ const pnl=+p.profit||((+p.sell_price||0)-(+p.buy_price||0)); S.live.hist.unshift({symbol:pos.symbol,dir:pos.dir,pnl,closed:Date.now()/1000,id}); delete S.live.open[id]; if(pnl<0) S.lastLossAt=Date.now(); log(`Closed #${id} · ${pnl>=0?'+':''}${money(pnl)}`,pnl>=0?'ok':'warn'); if(m.subscription) api.forget(m.subscription.id); renderPositions(); renderHistory(); drawChart(); } else renderPositions(); }).catch(e=>log('Could not track contract #'+id+': '+(e.message||''),'err')); }
-async function closePosition(id){ const pp=S.paper.open.find(p=>p.id===id); if(pp){ settlePaper(pp,S.lastTick||pp.entry,'manual'); return; } const lp=S.live.open[id]; if(lp){ try{ await api.send({sell:+id,price:0}); log('Sell sent for #'+id,'ok'); }catch(e){ log('Sell failed: '+(e.message||''),'err'); } } }
+function watchContract(id){ tapi.subscribe({proposal_open_contract:1,contract_id:id},m=>{ const p=m.proposal_open_contract; if(!p) return; const pos=S.live.open[id]; if(!pos) return; pos.profit=+p.profit||0; pos.now=+p.current_spot||pos.now; if(p.entry_spot) pos.entry=+p.entry_spot; if(p.is_sold||p.status==='sold'||p.status==='lost'||p.status==='won'){ const pnl=+p.profit||((+p.sell_price||0)-(+p.buy_price||0)); S.live.hist.unshift({symbol:pos.symbol,dir:pos.dir,pnl,closed:Date.now()/1000,id}); delete S.live.open[id]; if(pnl<0) S.lastLossAt=Date.now(); log(`Closed #${id} · ${pnl>=0?'+':''}${money(pnl)}`,pnl>=0?'ok':'warn'); if(m.subscription) tapi.forget(m.subscription.id); renderPositions(); renderHistory(); drawChart(); } else renderPositions(); }).catch(e=>log('Could not track contract #'+id+': '+(e.message||''),'err')); }
+async function closePosition(id){ const pp=S.paper.open.find(p=>p.id===id); if(pp){ settlePaper(pp,S.lastTick||pp.entry,'manual'); return; } const lp=S.live.open[id]; if(lp){ try{ await tapi.send({sell:+id,price:0}); log('Sell sent for #'+id,'ok'); }catch(e){ log('Sell failed: '+(e.message||''),'err'); } } }
 function settlePaper(p,price,why){ const pnl=p.risk*((p.dir===1?price-p.entry:p.entry-price)/p.R)-(p.entry*S.settings.cost/100)/p.R*p.risk; S.paper.balance+=pnl; S.paper.open=S.paper.open.filter(x=>x!==p); S.paper.hist.unshift({symbol:p.symbol,dir:p.dir,pnl,closed:Date.now()/1000,why}); if(pnl<0) S.lastLossAt=Date.now(); log(`PAPER closed ${p.symbol} (${why}) · ${pnl>=0?'+':''}${money(pnl)} · balance ${money(S.paper.balance)}`,pnl>=0?'ok':'warn'); store('od_paper',S.paper); renderHistory(); renderAccount(); drawChart(); }
 function checkPaper(q){ for(const p of [...S.paper.open]){ if(p.symbol!==S.symbol) continue; if(p.dir===1&&q<=p.sl) settlePaper(p,p.sl,'stop'); else if(p.dir===1&&q>=p.tp) settlePaper(p,p.tp,'target'); else if(p.dir===-1&&q>=p.sl) settlePaper(p,p.sl,'stop'); else if(p.dir===-1&&q<=p.tp) settlePaper(p,p.tp,'target'); } }
 function tryAutoTrade(d){ const key=S.symbol+':'+S.tf; if(!S.btDone[key]){ log('Auto-trade skipped: backtest this market first','warn'); return; } if(S.bt&&S.bt.pf<1.1&&S.bt.n>=30){ log('Auto-trade skipped: backtest shows no edge here','warn'); return; } placeTrade(d.dir,d.sl,d.tp,'auto'); }
@@ -608,7 +623,7 @@ function renderAccount(){ const paper=S.settings.mode==='paper'; const bal=curre
   const hist=paper?S.paper.hist:S.live.hist; $('aWin').textContent=hist.length?Math.round(hist.filter(h=>h.pnl>0).length/hist.length*100)+'% of '+hist.length:'—';
   $('modePill').innerHTML=`<i></i><span>${paper?'PAPER':(S.acct?(S.acct.is_virtual?'DEMO':'REAL MONEY'):'DERIV')}</span>`; $('modePill').className='pill '+(paper?'':(S.acct?(S.acct.is_virtual?'warn':'bad'):'')); }
 function updateAutoNote(){ const key=S.symbol+':'+S.tf; const n=$('autoNote'); if(S.killed){ n.innerHTML='<b>Kill switch is on.</b> No trades will be placed until you reset it.'; return; } if(!S.btDone[key]){ n.textContent='Auto-trade unlocks after you backtest this market and timeframe, so you have seen its real numbers first.'; $('btnAuto').disabled=true; return; } $('btnAuto').disabled=false; n.innerHTML=S.auto?`<b>Auto-trade is live</b> in ${S.settings.mode==='paper'?'paper':(S.acct&&S.acct.is_virtual?'demo':'REAL')} mode. It trades only when the engine signals, inside your risk brakes.`:'Backtested. You may switch auto-trade on. Start in paper or demo mode.'; }
-async function updateMults(){ const sel=$('mult'); let list=[50,100,150,200,250,300,500,1000]; if(S.connected){ try{ const r=await api.send({contracts_for:S.symbol,currency:S.currency,product_type:'basic'}); const m=(r.contracts_for.available||[]).find(a=>a.contract_type==='MULTUP'); if(m&&m.multiplier_range&&m.multiplier_range.length) list=m.multiplier_range; }catch(e){} } sel.innerHTML=list.map(v=>`<option value="${v}" ${v==S.settings.mult?'selected':''}>×${v}</option>`).join(''); if(!list.includes(+S.settings.mult)) sel.value=list[Math.min(1,list.length-1)]; updateStake(); }
+async function updateMults(){ const sel=$('mult'); let list=[50,100,150,200,250,300,500,1000]; if(S.connected){ try{ const r=await acct().send({contracts_for:S.symbol,currency:S.currency,product_type:'basic'}); const m=(r.contracts_for.available||[]).find(a=>a.contract_type==='MULTUP'); if(m&&m.multiplier_range&&m.multiplier_range.length) list=m.multiplier_range; }catch(e){} } sel.innerHTML=list.map(v=>`<option value="${v}" ${v==S.settings.mult?'selected':''}>×${v}</option>`).join(''); if(!list.includes(+S.settings.mult)) sel.value=list[Math.min(1,list.length-1)]; updateStake(); }
 
 /* ============================= SCANNER ============================= */
 async function scan(){ if(!S.connected){ log('Connect first','err'); return; } $('btnScan').disabled=true; $('scanBody').innerHTML='<tr><td colspan="5" class="empty">Scanning…</td></tr>'; const rows=[];
@@ -619,19 +634,37 @@ async function scan(){ if(!S.connected){ log('Connect first','err'); return; } $
 $('scanBody').addEventListener('click',e=>{ const tr=e.target.closest('[data-sym]'); if(tr){ S.symbol=tr.dataset.sym; $('symbolSel').value=S.symbol; loadMarket(); } });
 
 /* ============================= CONNECT ============================= */
+function dropAuth(){ S.authorized=false; S.acct=null; S.auto=false; $('btnAuto').textContent='Auto-trade: OFF'; $('btnAuto').className=''; }
+async function loginDeriv(){
+  const st=S.settings;
+  if(!st.token){ log('Deriv mode selected but no token saved. Streaming data only.','warn'); return; }
+  if(!st.appId){ log('Deriv needs an App ID with the token (Settings). Streaming data only.','warn'); return; }
+  try{
+    const r=await rest('/accounts'); const list=Array.isArray(r)?r:(r.data||r.accounts||[]);
+    S.accounts=list.map(a=>({id:a.account_id||a.loginid||a.id,type:(a.account_type||a.group||'').toLowerCase(),currency:a.currency||'USD',balance:+a.balance||0}));
+    if(!S.accounts.length) throw new Error('no options trading accounts on this token');
+    renderAccountChoices();
+    let chosen=S.accounts.find(a=>a.id===st.accountId)||S.accounts.find(a=>/demo|virtual/.test(a.type))||S.accounts[0];
+    const otp=await rest('/accounts/'+encodeURIComponent(chosen.id)+'/otp','POST'); const url=(otp.data&&otp.data.url)||otp.url; if(!url) throw new Error('no WebSocket URL returned for the account');
+    await tapi.connect([url]);
+    const isDemo=/demo|virtual/.test(chosen.type)||/\/ws\/demo/.test(url);
+    S.acct={balance:chosen.balance,currency:chosen.currency,loginid:chosen.id,is_virtual:isDemo}; S.currency=chosen.currency||'USD'; S.authorized=true; dayReset();
+    log(`Logged in to ${chosen.id} (${isDemo?'demo':'REAL'}) · ${money(S.acct.balance)}`,isDemo?'ok':'warn');
+    tapi.onClose=()=>{ const had=S.authorized; dropAuth(); if(had&&S.connected) log('Trading connection closed. Reconnect to log in again (each login uses a fresh one-time link). Auto-trade is off.','warn'); renderAccount(); };
+    tapi.subscribe({balance:1},m=>{ if(m.balance){ S.acct.balance=+m.balance.balance; renderAccount(); } }).catch(()=>{});
+    try{ const pf=await tapi.send({portfolio:1}); for(const ct of (pf.portfolio.contracts||[])){ if(!S.live.open[ct.contract_id]){ S.live.open[ct.contract_id]={id:ct.contract_id,symbol:ct.symbol||ct.underlying_symbol,dir:/MULTUP|CALL/.test(ct.contract_type)?1:-1,entry:0,sl:null,tp:null,stake:+ct.buy_price,profit:0,opened:ct.purchase_time}; watchContract(ct.contract_id); } } }catch(e){ log('Portfolio unavailable: '+(e.message||''),'warn'); }
+    try{ const pt=await tapi.send({profit_table:1,description:1,limit:50,sort:'DESC'}); S.live.hist=(pt.profit_table.transactions||[]).map(t=>({symbol:(t.shortcode||'').split('_')[1]||'',dir:/MULTUP|CALL/.test(t.shortcode||'')?1:-1,pnl:(+t.sell_price||0)-(+t.buy_price||0),closed:+t.sell_time||+t.purchase_time})); renderHistory(); }catch(e){}
+  }catch(e){ dropAuth(); log('Deriv login failed: '+(e.message||e)+'. Running with live data only. Check the token, the App ID and that the token has trade scope.','err'); }
+}
+function renderAccountChoices(){ const sel=$('accountId'); if(!S.accounts.length){ sel.innerHTML='<option value="">(connect once to list your accounts)</option>'; return; } sel.innerHTML=S.accounts.map(a=>`<option value="${a.id}" ${a.id===S.settings.accountId?'selected':''}>${a.id} · ${/demo|virtual/.test(a.type)?'demo':'REAL'} · ${a.currency} ${a.balance.toFixed(2)}</option>`).join(''); }
 async function connect(){
-  if(S.connected){ api.close(); return; }
+  if(S.connected){ api.close(); tapi.close(); return; }
   $('btnConnect').disabled=true; $('connPill').className='pill warn'; $('connPill').lastElementChild.textContent='CONNECTING';
-  try{ await api.connect(); S.connected=true; $('connPill').className='pill ok'; $('connPill').lastElementChild.textContent='LIVE DATA'; $('btnConnect').textContent='Disconnect'; log('Connected to Deriv data feed','ok');
-    api.onClose=()=>{ S.connected=false; S.authorized=false; S.acct=null; S.auto=false; $('btnAuto').textContent='Auto-trade: OFF'; $('btnAuto').className=''; $('connPill').className='pill bad'; $('connPill').lastElementChild.textContent='DISCONNECTED'; $('btnConnect').textContent='Connect'; $('btnConnect').disabled=false; log('Connection closed. Auto-trade switched off for safety.','warn'); renderAccount(); };
-    if(S.settings.mode==='deriv'&&S.settings.token){ try{ const a=await api.send({authorize:S.settings.token}); S.acct={balance:+a.authorize.balance,currency:a.authorize.currency,loginid:a.authorize.loginid,is_virtual:!!a.authorize.is_virtual}; S.currency=a.authorize.currency||'USD'; S.authorized=true; log(`Authorised ${S.acct.loginid} (${S.acct.is_virtual?'demo':'REAL'}) · ${money(S.acct.balance)}`,S.acct.is_virtual?'ok':'warn'); dayReset();
-        api.subscribe({balance:1},m=>{ if(m.balance){ S.acct.balance=+m.balance.balance; renderAccount(); } });
-        const pf=await api.send({portfolio:1}); for(const ct of (pf.portfolio.contracts||[])){ if(!S.live.open[ct.contract_id]){ S.live.open[ct.contract_id]={id:ct.contract_id,symbol:ct.symbol,dir:/MULTUP|CALL/.test(ct.contract_type)?1:-1,entry:0,sl:null,tp:null,stake:+ct.buy_price,profit:0,opened:ct.purchase_time}; watchContract(ct.contract_id); } }
-        const pt=await api.send({profit_table:1,description:1,limit:50,sort:'DESC'}); S.live.hist=(pt.profit_table.transactions||[]).map(t=>({symbol:(t.shortcode||'').split('_')[1]||'',dir:/MULTUP|CALL/.test(t.shortcode||'')?1:-1,pnl:(+t.sell_price||0)-(+t.buy_price||0),closed:+t.sell_time||+t.purchase_time})); renderHistory();
-      }catch(e){ log('Token rejected: '+(e.message||'')+'. Running with live data only.','err'); } }
-    else if(S.settings.mode==='deriv') log('Deriv mode selected but no token saved. Streaming data only.','warn');
+  try{ await api.connect(PUBLIC_WS); S.connected=true; $('connPill').className='pill ok'; $('connPill').lastElementChild.textContent='LIVE DATA'; $('btnConnect').textContent='Disconnect'; log('Connected to Deriv market data'+(api.url.includes('/v3')?' (legacy feed)':''),'ok');
+    api.onClose=()=>{ S.connected=false; dropAuth(); tapi.close(); $('connPill').className='pill bad'; $('connPill').lastElementChild.textContent='DISCONNECTED'; $('btnConnect').textContent='Connect'; $('btnConnect').disabled=false; log('Connection closed. Auto-trade switched off for safety.','warn'); renderAccount(); };
+    if(S.settings.mode==='deriv') await loginDeriv();
     await loadMarket(); renderAccount();
-  }catch(e){ log('Connection failed: '+(e.message||e)+'. Check your internet; the Deriv feed may also be blocked on some networks.','err'); $('connPill').className='pill bad'; $('connPill').lastElementChild.textContent='FAILED'; }
+  }catch(e){ log('Connection failed: '+(e.message||e)+'. Check your internet; some networks block trading feeds.','err'); $('connPill').className='pill bad'; $('connPill').lastElementChild.textContent='FAILED'; }
   $('btnConnect').disabled=false;
 }
 
@@ -657,9 +690,9 @@ $('showZones').onchange=drawChart;
 // settings drawer
 const openDrawer=o=>{ $('drawer').classList.toggle('open',o); $('scrim').classList.toggle('open',o); };
 $('btnSettings').onclick=()=>openDrawer(true); $('btnCloseDrawer').onclick=()=>openDrawer(false); $('scrim').onclick=()=>openDrawer(false);
-const SKEYS=['token','mode','maxTrades','dailyLoss','cooldown','maxOpen','threshold','lookback','maxHold','cost','kzOnly','biasOnly','realOk'];
-function fillSettings(){ for(const k of SKEYS){ const el=$(k); if(el.type==='checkbox') el.checked=!!S.settings[k]; else el.value=S.settings[k]; } $('riskPct').value=S.settings.riskPct; $('rr').value=S.settings.rr; $('wlNote').textContent=SYMBOLS.map(x=>x.n).join(' · '); }
-$('btnSave').onclick=()=>{ for(const k of SKEYS){ const el=$(k); S.settings[k]=el.type==='checkbox'?el.checked:(el.type==='number'?+el.value:el.value); } S.settings.riskPct=+$('riskPct').value||1; S.settings.rr=+$('rr').value||2; store('od_settings',S.settings); openDrawer(false); log('Settings saved. '+(S.settings.mode==='deriv'?'Reconnect to apply the token.':'Paper mode.'),'ok'); renderAccount(); renderHistory(); if(S.candles.length){ onCandlesReady(); } S.btDone={}; S.bt=null; updateAutoNote(); };
+const SKEYS=['token','appId','accountId','mode','maxTrades','dailyLoss','cooldown','maxOpen','threshold','lookback','maxHold','cost','kzOnly','biasOnly','realOk'];
+function fillSettings(){ renderAccountChoices(); for(const k of SKEYS){ const el=$(k); if(el.type==='checkbox') el.checked=!!S.settings[k]; else el.value=S.settings[k]; } $('riskPct').value=S.settings.riskPct; $('rr').value=S.settings.rr; $('wlNote').textContent=SYMBOLS.map(x=>x.n).join(' · '); }
+$('btnSave').onclick=()=>{ for(const k of SKEYS){ const el=$(k); S.settings[k]=el.type==='checkbox'?el.checked:(el.type==='number'?+el.value:el.value); } S.settings.riskPct=+$('riskPct').value||1; S.settings.rr=+$('rr').value||2; store('od_settings',S.settings); openDrawer(false); log('Settings saved. '+(S.settings.mode==='deriv'?'Reconnect to log in with the token.':'Paper mode.'),'ok'); renderAccount(); renderHistory(); if(S.candles.length){ onCandlesReady(); } S.btDone={}; S.bt=null; updateAutoNote(); };
 // clock
 setInterval(()=>{ const d=new Date(); const kz=inKillzone(d.getTime()/1000); $('clock').className='pill '+(kz?'ok':''); $('clock').lastElementChild.textContent=d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+(kz?' · KILLZONE':' · '+String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0')+' UTC'); },1000);
 // restore
